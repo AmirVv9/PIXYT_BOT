@@ -1,0 +1,82 @@
+name: Test platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube:
+        description: "YouTube URL"
+        required: false
+        default: "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+      instagram:
+        description: "Instagram URL (reel/post)"
+        required: false
+        default: ""
+      tiktok:
+        description: "TikTok URL"
+        required: false
+        default: ""
+      twitter:
+        description: "Twitter/X URL"
+        required: false
+        default: ""
+      pinterest:
+        description: "Pinterest URL"
+        required: false
+        default: ""
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: youtube
+            url: ${{ inputs.youtube }}
+          - name: instagram
+            url: ${{ inputs.instagram }}
+          - name: tiktok
+            url: ${{ inputs.tiktok }}
+          - name: twitter
+            url: ${{ inputs.twitter }}
+          - name: pinterest
+            url: ${{ inputs.pinterest }}
+
+    steps:
+      - name: Skip notice
+        if: matrix.url == ''
+        run: echo "No URL provided for ${{ matrix.name }}, skipped."
+
+      - uses: actions/setup-python@v5
+        if: matrix.url != ''
+        with:
+          python-version: "3.12"
+
+      - name: Install yt-dlp
+        if: matrix.url != ''
+        run: |
+          pip install -U "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
+          yt-dlp --list-impersonate-targets | head -n 15
+
+      - name: Download test (lowest quality, for speed)
+        if: matrix.url != ''
+        env:
+          URL: ${{ matrix.url }}
+        run: |
+          yt-dlp --impersonate chrome --no-playlist \
+            -f "wv*+wa/w" -o "out/%(id)s.%(ext)s" \
+            "$URL" 2>&1 | tee log.txt
+          ls -lh out
+
+      - name: Summary
+        if: always() && matrix.url != ''
+        run: |
+          {
+            echo "### ${{ matrix.name }}: ${{ job.status }}"
+            echo '```'
+            if [ -f log.txt ]; then tail -n 6 log.txt; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
