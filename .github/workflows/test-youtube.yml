@@ -1,0 +1,50 @@
+name: Test YouTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "YouTube URL"
+        required: false
+        default: "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp
+        run: |
+          pip install -U "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
+          deno --version
+
+      - name: Download test
+        env:
+          URL: ${{ inputs.url }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          ARGS=()
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s\n' "$YT_COOKIES" > cookies.txt
+            ARGS+=(--cookies cookies.txt)
+            echo "Using cookies from secret."
+          else
+            echo "No cookies secret found."
+          fi
+          yt-dlp --impersonate chrome --no-playlist "${ARGS[@]}" \
+            -f "wv*+wa/w" -o "out/%(id)s.%(ext)s" \
+            "$URL" 2>&1 | tee log.txt
+          ls -lh out
+
+      - name: Cleanup
+        if: always()
+        run: rm -f cookies.txt
