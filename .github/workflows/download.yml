@@ -171,7 +171,7 @@ jobs:
 
           ALLOWED = re.compile(
               r"^https?://(?:[a-z0-9-]+\.)*(?:instagram\.com|tiktok\.com|twitter\.com|x\.com|reddit\.com|redd\.it|pin\.it"
-              r"|pinterest\.[a-z]{2,3}(?:\.[a-z]{2})?)(?:[/?#]|$)",
+              r"|pinterest\.[a-z]{2,3}(?:\.[a-z]{2})?|pornhub\.com)(?:[/?#]|$)",
               re.I,
           )
           VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
