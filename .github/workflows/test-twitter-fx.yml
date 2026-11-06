@@ -1,0 +1,35 @@
+name: Test Twitter via FxTwitter
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Tweet URL"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch tweet info and video
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          ID=$(echo "$URL" | grep -oE '/status/[0-9]+' | head -n 1 | grep -oE '[0-9]+' || true)
+          if [ -z "$ID" ]; then echo "No status id found in URL"; exit 1; fi
+          echo "Tweet id: $ID"
+
+          curl -sS -A "Mozilla/5.0" "https://api.fxtwitter.com/status/$ID" -o tweet.json
+
+          jq '{code, message, text: .tweet.text, media: .tweet.media}' tweet.json > summary.json || true
+          head -n 60 summary.json
+
+          VIDEO=$(jq -r '.tweet.media.videos[0].url // empty' tweet.json)
+          if [ -z "$VIDEO" ]; then
+            echo "No video URL in API response"
+            exit 1
+          fi
+
+          curl -sS -L -A "Mozilla/5.0" "$VIDEO" -o out.mp4
+          ls -lh out.mp4
