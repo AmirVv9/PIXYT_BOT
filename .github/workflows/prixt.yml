@@ -1,0 +1,388 @@
+name: Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Link to download"
+        required: true
+      chat_id:
+        description: "Telegram chat id (group ids look like -100123...)"
+        required: true
+      thread_id:
+        description: "Topic (thread) id, empty for General or private chat"
+        required: false
+        default: ""
+      status_id:
+        description: "Processing message id to delete when done (optional)"
+        required: false
+        default: ""
+      force_mtproto:
+        description: "Test: send even small files via MTProto"
+        type: boolean
+        required: false
+        default: false
+
+permissions: {}
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          pip install -U "yt-dlp[default,curl-cffi]" requests "telethon>=1.36"
+          pip install cryptg || true
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          ffmpeg -version > /dev/null
+
+      - name: Download and send
+        env:
+          URL: ${{ inputs.url }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          THREAD_ID: ${{ inputs.thread_id }}
+          STATUS_ID: ${{ inputs.status_id }}
+          FORCE_MTPROTO: ${{ inputs.force_mtproto }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python3 - <<'PY'
+          import asyncio, glob, json, math, os, re, subprocess, sys
+          from urllib.parse import urlparse
+          import requests
+
+          TOKEN = os.environ["BOT_TOKEN"]
+          API = "https://api.telegram.org/bot" + TOKEN
+          URL = os.environ["URL"].strip()
+          CHAT = os.environ["CHAT_ID"].strip()
+          THREAD = os.environ.get("THREAD_ID", "").strip()
+          STATUS = os.environ.get("STATUS_ID", "").strip()
+          FORCE = os.environ.get("FORCE_MTPROTO", "").strip().lower() == "true"
+          API_ID = os.environ.get("TG_API_ID", "").strip()
+          API_HASH = os.environ.get("TG_API_HASH", "").strip()
+          MT_OK = bool(API_ID and API_HASH)
+
+          MB = 1024 * 1024
+          BOT_LIMIT = 49 * MB      # Bot API upload limit (with margin)
+          MT_LIMIT = 1900 * MB     # MTProto bot upload limit is ~2000 MiB (with margin)
+          SPLIT_PART = 1500 * MB   # target size per part when splitting huge videos
+
+          ALLOWED = re.compile(
+              r"^https?://(?:[a-z0-9-]+\.)*(?:instagram\.com|tiktok\.com|twitter\.com|x\.com|pin\.it"
+              r"|pinterest\.[a-z]{2,3}(?:\.[a-z]{2})?)(?:[/?#]|$)",
+              re.I,
+          )
+          VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
+          PHOTO_EXT = (".jpg", ".jpeg", ".png", ".webp")
+
+
+          def tg(method, **data):
+              try:
+                  r = requests.post(API + "/" + method, data=data, timeout=60)
+                  return r.json()
+              except Exception as e:
+                  print("telegram call failed:", method, type(e).__name__)
+                  return {}
+
+
+          def thread_args():
+              return {"message_thread_id": THREAD} if THREAD else {}
+
+
+          def notify(text):
+              tg("sendMessage", chat_id=CHAT, text=text, **thread_args())
+
+
+          def clear_status():
+              if STATUS:
+                  tg("deleteMessage", chat_id=CHAT, message_id=STATUS)
+
+
+          def fail(text):
+              print("FAILED:", text)
+              notify("❌ " + text)
+              clear_status()
+              sys.exit(1)
+
+
+          def files():
+              result = []
+              for f in sorted(glob.glob("out/*")):
+                  if f.endswith((".part", ".ytdl", ".temp", ".json", ".thumb.jpg")):
+                      continue
+                  if re.search(r"\.f[0-9a-z-]+\.[a-z0-9]+$", f):
+                      continue
+                  result.append(f)
+              return result
+
+
+          def ytdlp(sort):
+              for f in glob.glob("out/*"):
+                  os.remove(f)
+              cmd = [
+                  "yt-dlp", "--impersonate", "chrome", "--no-warnings", "--restrict-filenames",
+                  "--playlist-items", "1:10", "-S", sort, "--merge-output-format", "mp4",
+                  "-o", "out/%(autonumber)s_%(id)s.%(ext)s", "--", URL,
+              ]
+              p = subprocess.run(cmd, capture_output=True, text=True)
+              print(p.stdout[-3000:])
+              print(p.stderr[-3000:])
+              errs = [l for l in p.stderr.splitlines() if l.startswith("ERROR")]
+              return errs[-1] if errs else ""
+
+
+          def fx_fallback():
+              host = (urlparse(URL).hostname or "").lower()
+              m = re.search(r"/status/(\d+)", URL)
+              is_tw = host in ("x.com", "twitter.com") or host.endswith((".x.com", ".twitter.com"))
+              if not m or not is_tw:
+                  return []
+              try:
+                  r = requests.get(
+                      "https://api.fxtwitter.com/status/" + m.group(1),
+                      headers={"User-Agent": "Mozilla/5.0"}, timeout=30,
+                  )
+                  media = (r.json().get("tweet") or {}).get("media") or {}
+              except Exception as e:
+                  print("fxtwitter failed:", type(e).__name__)
+                  return []
+              items = [(v.get("url"), ".mp4") for v in (media.get("videos") or [])]
+              items += [(p.get("url"), ".jpg") for p in (media.get("photos") or [])]
+              out = []
+              for i, (u, default_ext) in enumerate(items):
+                  if not u:
+                      continue
+                  ext = os.path.splitext(urlparse(u).path)[1].lower()
+                  if ext not in VIDEO_EXT + PHOTO_EXT:
+                      ext = default_ext
+                  path = "out/fx_%d%s" % (i, ext)
+                  try:
+                      with requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=60) as resp:
+                          resp.raise_for_status()
+                          with open(path, "wb") as fh:
+                              for chunk in resp.iter_content(1 << 20):
+                                  fh.write(chunk)
+                      out.append(path)
+                  except Exception as e:
+                      print("fx download failed:", type(e).__name__)
+              return out
+
+
+          # ---------- Bot API upload (small files) ----------
+          def send_botapi(path):
+              ext = os.path.splitext(path)[1].lower()
+              if ext in VIDEO_EXT:
+                  method, field = "sendVideo", "video"
+              elif ext == ".gif":
+                  method, field = "sendAnimation", "animation"
+              elif ext in PHOTO_EXT:
+                  method, field = "sendPhoto", "photo"
+              else:
+                  method, field = "sendDocument", "document"
+              for m, fld in ((method, field), ("sendDocument", "document")):
+                  data = {"chat_id": CHAT}
+                  data.update(thread_args())
+                  if m in ("sendVideo", "sendPhoto", "sendAnimation"):
+                      data["has_spoiler"] = "true"
+                  if m == "sendVideo":
+                      data["supports_streaming"] = "true"
+                  try:
+                      with open(path, "rb") as fh:
+                          r = requests.post(API + "/" + m, data=data, files={fld: fh}, timeout=300)
+                      if r.ok and r.json().get("ok"):
+                          return True
+                      print("send failed:", m, r.status_code, r.text[:300])
+                  except Exception as e:
+                      print("send error:", m, type(e).__name__)
+                  if m == "sendDocument":
+                      break
+              return False
+
+
+          # ---------- MTProto upload (large files, up to ~2GB) ----------
+          def probe(path):
+              try:
+                  p = subprocess.run(
+                      ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                       "-show_entries", "stream=width,height:format=duration", "-of", "json", path],
+                      capture_output=True, text=True, timeout=120,
+                  )
+                  d = json.loads(p.stdout)
+                  st = (d.get("streams") or [{}])[0]
+                  dur = int(float((d.get("format") or {}).get("duration") or 0))
+                  return dur, int(st.get("width") or 0), int(st.get("height") or 0)
+              except Exception:
+                  return 0, 0, 0
+
+
+          def make_thumb(path):
+              t = path + ".thumb.jpg"
+              try:
+                  r = subprocess.run(
+                      ["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", path,
+                       "-frames:v", "1", "-vf", "scale=320:-2", t],
+                      capture_output=True, timeout=120,
+                  )
+                  if r.returncode == 0 and os.path.exists(t):
+                      return t
+              except Exception:
+                  pass
+              return None
+
+
+          def split_video(path):
+              dur, _, _ = probe(path)
+              size = os.path.getsize(path)
+              if dur <= 0:
+                  return []
+              parts = max(2, math.ceil(size / SPLIT_PART))
+              seg = max(1, int(dur / parts) + 1)
+              base = os.path.splitext(path)[0]
+              subprocess.run(
+                  ["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-map", "0:v", "-map", "0:a?",
+                   "-c", "copy", "-f", "segment", "-segment_time", str(seg),
+                   "-reset_timestamps", "1", base + "_part%02d.mp4"],
+                  capture_output=True,
+              )
+              out = sorted(glob.glob(base + "_part*.mp4"))
+              if out:
+                  os.remove(path)
+              return out
+
+
+          def prepare_big(path):
+              size = os.path.getsize(path)
+              if size <= MT_LIMIT:
+                  return [path]
+              if os.path.splitext(path)[1].lower() in VIDEO_EXT:
+                  pieces = split_video(path)
+                  if pieces and all(os.path.getsize(p) <= MT_LIMIT for p in pieces):
+                      notify("ℹ️ ویدیو بزرگ‌تر از ۲ گیگابایت بود و در %d بخش ارسال می‌شود." % len(pieces))
+                      return pieces
+              notify("⚠️ فایلی بزرگ‌تر از حد مجاز تلگرام (۲ گیگابایت) بود و ارسال نشد.")
+              return []
+
+
+          async def resolve_peer(client):
+              from telethon.tl.functions.channels import GetChannelsRequest
+              from telethon.tl.functions.users import GetUsersRequest
+              from telethon.tl.types import InputChannel, InputPeerChannel, InputPeerUser, InputUser
+
+              cid = int(CHAT)
+              if cid > 0:
+                  res = await client(GetUsersRequest([InputUser(user_id=cid, access_hash=0)]))
+                  h = getattr(res[0], "access_hash", None) if res else None
+                  if h is None:
+                      raise ValueError("user peer not resolvable")
+                  return InputPeerUser(user_id=cid, access_hash=h)
+              s = str(cid)
+              if s.startswith("-100"):
+                  res = await client(GetChannelsRequest([InputChannel(channel_id=int(s[4:]), access_hash=0)]))
+                  c = res.chats[0] if res.chats else None
+                  h = getattr(c, "access_hash", None)
+                  if h is None:
+                      raise ValueError("group peer not resolvable")
+                  return InputPeerChannel(channel_id=c.id, access_hash=h)
+              raise ValueError("unsupported chat type for MTProto")
+
+
+          async def mtproto_send(paths):
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.tl.types import DocumentAttributeVideo
+
+              client = TelegramClient(StringSession(), int(API_ID), API_HASH)
+              await client.start(bot_token=TOKEN)
+              sent = 0
+              try:
+                  peer = await resolve_peer(client)
+                  reply_to = int(THREAD) if THREAD else None
+                  for path in paths:
+                      ext = os.path.splitext(path)[1].lower()
+                      kwargs = {}
+                      if ext in VIDEO_EXT:
+                          dur, w, h = probe(path)
+                          kwargs["attributes"] = [
+                              DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)
+                          ]
+                          thumb = make_thumb(path)
+                          if thumb:
+                              kwargs["thumb"] = thumb
+                          kwargs["spoiler"] = True
+                      elif ext in PHOTO_EXT:
+                          if os.path.getsize(path) > 10 * MB:
+                              kwargs["force_document"] = True
+                          else:
+                              kwargs["spoiler"] = True
+                      elif ext == ".gif":
+                          kwargs["spoiler"] = True
+                      else:
+                          kwargs["force_document"] = True
+                      try:
+                          try:
+                              await client.send_file(peer, path, reply_to=reply_to, **kwargs)
+                          except TypeError:
+                              kwargs.pop("spoiler", None)
+                              await client.send_file(peer, path, reply_to=reply_to, **kwargs)
+                          sent += 1
+                      except Exception as e:
+                          print("mtproto send failed:", type(e).__name__, str(e)[:300])
+                          notify("⚠️ ارسال یک فایل بزرگ ناموفق بود: " + type(e).__name__)
+              finally:
+                  await client.disconnect()
+              return sent
+
+
+          def main():
+              if not ALLOWED.match(URL):
+                  fail("این لینک پشتیبانی نمی‌شود.")
+              os.makedirs("out", exist_ok=True)
+
+              last_err = ytdlp("vcodec:h264,res,acodec:aac")
+              got = files()
+              if not got:
+                  got = fx_fallback()
+              if not got:
+                  fail("دانلود ناموفق بود.\n" + (last_err[:200] if last_err else "خطای نامشخص"))
+
+              api_paths, mt_paths = [], []
+              for f in got[:10]:
+                  if os.path.getsize(f) > BOT_LIMIT or (FORCE and MT_OK):
+                      mt_paths.append(f)
+                  else:
+                      api_paths.append(f)
+
+              sent = 0
+              for f in api_paths:
+                  if send_botapi(f):
+                      sent += 1
+
+              if mt_paths:
+                  if not MT_OK:
+                      notify("⚠️ فایل بزرگ‌تر از ۵۰ مگابایت است. برای ارسالش باید TG_API_ID و TG_API_HASH تنظیم شود.")
+                  else:
+                      expanded = []
+                      for f in mt_paths:
+                          expanded += prepare_big(f)
+                      if expanded:
+                          try:
+                              sent += asyncio.run(mtproto_send(expanded))
+                          except Exception as e:
+                              print("mtproto failed:", type(e).__name__, str(e)[:300])
+                              notify("⚠️ ارسال فایل بزرگ ناموفق بود: " + type(e).__name__)
+
+              if sent == 0:
+                  fail("ارسال به تلگرام ناموفق بود.")
+              clear_status()
+              print("Done, sent:", sent)
+
+
+          main()
+          PY
