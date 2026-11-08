@@ -10,6 +10,11 @@ run-name: Download
 # - All texts the bot sends are in the "Bot texts" block (dict T) of the script below. Keep them emoji-free.
 # - Optional secrets: TG_API_ID + TG_API_HASH (files over 50 MB), YTDLP_COOKIES (Netscape cookies.txt),
 #   YTDLP_PROXY (your own proxy URL; if absent the free WARP tunnel is used when a site blocks this server).
+#   Cookies can also be managed from Telegram with /admin in the bot (they are merged with YTDLP_COOKIES).
+# - Optional repository variable (Settings -> Secrets and variables -> Actions -> Variables):
+#   MT_CONNS = number of parallel connections for large MTProto uploads (default 6, 1 turns it off).
+# - The job talks to the bot's Worker (heartbeat, Cancel button, result, cookies). Without that address in the
+#   job (manual runs) all of this is simply skipped.
 
 on:
   workflow_dispatch:
@@ -185,10 +190,11 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
           YTDLP_PROXY: ${{ secrets.YTDLP_PROXY }}
+          MT_CONNS: ${{ vars.MT_CONNS }}
           PYTHONUNBUFFERED: "1"
         run: |
           "$TOOLS_DIR/venv/bin/python" - <<'PY'
-          import asyncio, base64, glob, hashlib, html as htmllib, importlib, json, math, os, re, socket, subprocess, sys, threading, time, traceback
+          import asyncio, base64, glob, hashlib, html as htmllib, importlib, ipaddress, json, math, os, re, signal, socket, subprocess, sys, threading, time, traceback
           from urllib.parse import urljoin, urlparse
           import requests
 
@@ -208,6 +214,24 @@ jobs:
           API_ID = os.environ.get("TG_API_ID", "").strip()
           API_HASH = os.environ.get("TG_API_HASH", "").strip()
           MT_OK = bool(API_ID and API_HASH)
+
+
+          def _int_env(name, default, lo, hi):
+              try:
+                  v = int((os.environ.get(name, "") or "").strip() or default)
+              except ValueError:
+                  v = default
+              return max(lo, min(hi, v))
+
+
+          MT_CONNS = _int_env("MT_CONNS", 6, 1, 10)   # parallel MTProto upload connections (1 = off)
+          CB, JOB_ID, JOB_TOKEN = "", "", ""          # Worker callback address, job id, job token (set by load_job)
+          NB = False                                  # True: the Worker has no queue, so no Cancel/Retry buttons and no heartbeats
+          RP = ""                                     # id of the user's own message to reply to (only when it was not deleted)
+          ATTEMPT = 0
+          PROG_INT = 7.0                              # seconds between live progress edits (the Worker raises it when jobs share a chat)
+          HB_EVERY = 5.0                              # seconds between heartbeats
+          MAX_ITEMS = 30                              # most files taken from one post
           TOOLS_DIR = os.environ.get("TOOLS_DIR", "/home/runner/dltools")
 
           MB = 1024 * 1024
@@ -215,7 +239,6 @@ jobs:
           MT_LIMIT = 1900 * MB         # MTProto bot upload limit is about 2000 MiB (with margin)
           SPLIT_PART = 1500 * MB       # target size per part when splitting huge videos
           ALBUM_MAX_TOTAL = 150 * MB   # max total size for one album request
-          MIN_INTERVAL = 7.0           # seconds between live progress edits (Telegram allows ~20 msgs/min per group)
           YT_MAX_MIN = 60              # YouTube videos longer than this are refused
           META = "/tmp/dlbot_meta.json"
           DONE = "/tmp/dlbot_done"     # marker: the job already reported its own result to Telegram
@@ -231,7 +254,7 @@ jobs:
           # ============================================================================
           SITES = [
               "instagram.com", "tiktok.com", "twitter.com", "x.com", "reddit.com", "redd.it", "pin.it",
-              "youtube.com", "youtu.be","pornhub.com", "pimpbunny.com",
+              "youtube.com", "youtu.be", "pimpbunny.com",
           ]
           # pinterest.* with any country domain is matched separately below.
           # ============================================================================
@@ -246,36 +269,60 @@ jobs:
               "download": "Downloading",
               "merge": "Merging audio and video",
               "upload": "Uploading",
-              "lower": "File too big, trying a lower quality...",
-              "update": "Updating the downloader...",
-              "proxy": "Retrying through another connection...",
-              "scrape": "Looking for the media on the page...",
-              "split": "Splitting the video...",
-              "prep": "Preparing large upload...",
+              "lower": "File is large, trying a lower quality",
+              "update": "Updating the downloader",
+              "proxy": "Retrying through another connection",
+              "scrape": "Looking for the media on the page",
+              "split": "Splitting the video",
+              "prep": "Preparing the upload",
               "left": "left",
               "source": "Source",
-              "unsupported": "This link isn't supported.",
-              "dl_failed": "Couldn't download this link.\n%s",
-              "too_big": "This file is too big for Telegram, even in low quality.",
-              "too_big_botapi": "This file is over 50 MB, even in low quality. Set the upload method to Auto in /setting to send larger files.",
-              "too_long": "This video is too long (the limit is %d minutes).",
-              "send_failed": "Couldn't send the file to Telegram. Please try again.",
-              "over_2gb": "This file is over Telegram's 2 GB limit, so it couldn't be sent.",
-              "no_big_upload": "This file is over 50 MB and large-file upload isn't enabled.",
-              "botapi_only": "This file is over 50 MB and the upload method is set to Bot API. Change it in /setting.",
-              "big_unavailable": "Large-file upload is unavailable right now.",
-              "big_failed": "Large-file upload failed (%s).",
-              "partial": "Sent %d of %d files.",
-              "split_note": "Over 2 GB, so it's sent in %d parts.",
-              "unknown_error": "Something unexpected happened.",
+              "cancelled": "Cancelled\nThe download was stopped.",
+              "partial": "Sent %d of %d files.\nThe rest could not be delivered.",
+              "split_note": "The file is over 2 GB, so it was sent in %d parts.",
+              "cut_note": "Only the first %d items of this post were sent.",
               "link_one": "Direct link",
               "link_many": "Direct link %d/%d",
               "link_video": "Video: ",
               "link_audio": "Audio: ",
-              "link_ip": "(tied to the server that made it, so it may not open on your device)",
-              "link_stream": "(a stream playlist: open it in a player such as VLC)",
-              "link_expire": "Direct links can expire after a while.",
+              "link_ip": "(works only from the server that made it, so it may not open on your device)",
+              "link_stream": "(stream playlist: open it in a player such as VLC)",
+              "link_expire": "Direct links expire after a while.",
           }
+
+          # Every error the user can see has the same shape:
+          #   Title / Reason: ... / Next step: ...        (key -> title, reason, next step, retry button?)
+          ERR = {
+              "unsupported": ("Link not supported", "This site isn't supported.", "Send a link from a supported site. See /help.", False),
+              "verify": ("Download failed", "The site asked this server to prove it is not a bot.", "Try again in a few minutes.", True),
+              "limited": ("Download failed", "The site is limiting requests right now.", "Try again in a few minutes.", True),
+              "login": ("Download failed", "The post may be private, age-restricted or need a login.", "Make sure the post is public, then send the link again.", False),
+              "gone": ("Download failed", "The post was deleted or is unavailable.", None, False),
+              "geo": ("Download failed", "The content isn't available in this server's region.", None, False),
+              "nomedia": ("Download failed", "No downloadable media was found in this link.", "Check the link and try again.", False),
+              "unknown": ("Download failed", "Something unexpected went wrong.", "Try again. If it keeps failing, contact the bot owner.", True),
+              "toobig": ("File too large", "The file exceeds Telegram's size limit even in the lowest quality.", None, False),
+              "toobig_botapi": ("File too large", "The file is over 50 MB and uploads are set to Bot API only.", "Set Upload to Auto in /setting.", False),
+              "nobig": ("File too large", "The file is over 50 MB and large-file upload isn't enabled on this bot.", None, False),
+              "toolong": ("Video too long", "Videos longer than %d minutes aren't supported.", None, False),
+              "over2gb": ("File too large", "The file is over Telegram's 2 GB limit.", None, False),
+              "send": ("Upload failed", "Telegram didn't accept the file.", "Try again.", True),
+              "bigfail": ("Upload failed", "The large-file upload didn't complete.", "Try again.", True),
+              "bigunavail": ("Upload failed", "Large-file upload is unavailable right now.", "Try again later.", True),
+              "crash": ("Something went wrong", "The download stopped unexpectedly.", "Try again.", True),
+          }
+
+
+          def err_text(key, *args):
+              title, reason, step, _ = ERR[key]
+              lines = [title, "Reason: " + (reason % args if args else reason)]
+              if step:
+                  lines.append("Next step: " + step)
+              return "\n".join(lines)
+
+
+          def err_retry(key):
+              return ERR[key][3]
 
           SENSITIVE = []                       # strings that must never reach the (public) log
           STATE = {"send_failed": False}       # True when Telegram itself rejected an upload (real failure, not user error)
@@ -331,7 +378,10 @@ jobs:
 
 
           def thread_args():
-              return {"message_thread_id": THREAD} if THREAD else {}
+              out = {"message_thread_id": THREAD} if THREAD else {}
+              if RP:
+                  out["reply_parameters"] = json.dumps({"message_id": int(RP), "allow_sending_without_reply": True})
+              return out
 
 
           def notify(text):
@@ -351,7 +401,11 @@ jobs:
 
 
           def fmt_eta(s):
-              s = int(s)
+              try:
+                  s = int(s)
+              except (OverflowError, ValueError):   # infinity / NaN from a stalled transfer
+                  return "--"
+              s = max(0, min(s, 99 * 3600))
               if s < 60:
                   return "%ds" % s
               if s < 3600:
@@ -385,24 +439,44 @@ jobs:
               return "\n".join(lines)
 
 
+          def kb(buttons):
+              return json.dumps({"inline_keyboard": [buttons]})
+
+
+          EMPTY_KB = json.dumps({"inline_keyboard": []})
+
+
+          def cancel_kb():
+              return kb([{"text": "Cancel", "callback_data": "x:" + JOB_ID}]) if (CB and JOB_ID and not NB) else None
+
+
+          def retry_kb():
+              return kb([{"text": "Retry", "callback_data": "r:" + JOB_ID}]) if (CB and JOB_ID and not NB) else None
+
+
           class Status:
               def __init__(self):
                   self.last_t = 0.0
                   self.last_text = ""
                   self.block_until = 0.0
                   self.dead = False
+                  self.frozen = False          # set when the job is being cancelled: no more progress edits
                   self.lock = threading.Lock()
 
               def set(self, text, force=False):
-                  if not STATUS or self.dead:
+                  if not STATUS or self.dead or self.frozen:
                       return
                   with self.lock:
                       now = time.time()
                       if text == self.last_text or now < self.block_until:
                           return
-                      if not force and now - self.last_t < MIN_INTERVAL:
+                      if not force and now - self.last_t < PROG_INT:
                           return
-                      r = tg("editMessageText", timeout=15, chat_id=CHAT, message_id=STATUS, text=text)
+                      extra = {}
+                      k = cancel_kb()
+                      if k:
+                          extra["reply_markup"] = k
+                      r = tg("editMessageText", timeout=15, chat_id=CHAT, message_id=STATUS, text=text, **extra)
                       if r.get("ok"):
                           self.last_t, self.last_text = now, text
                           return
@@ -417,20 +491,25 @@ jobs:
                       else:
                           print("status edit failed:", desc[:120])
 
-              def finish(self, text):
-                  """Final text in the status message (waits out a flood limit); falls back to a new message."""
+              def finish(self, text, markup=None):
+                  """Final text in the status message (waits out a flood limit); falls back to a new message.
+                  The progress keyboard is always replaced: by `markup` (for example Retry) or by nothing."""
                   if STATUS and not self.dead:
                       wait = self.block_until - time.time()
                       if 0 < wait <= 15:
                           time.sleep(wait)
-                      r = tg("editMessageText", timeout=15, chat_id=CHAT, message_id=STATUS, text=text)
+                      r = tg("editMessageText", timeout=15, chat_id=CHAT, message_id=STATUS, text=text,
+                             reply_markup=markup or EMPTY_KB)
                       if r.get("ok") or "not modified" in str(r.get("description", "")):
                           return
                   notify(text)
 
 
           status = Status()
-          PROBLEMS = []  # reasons why something could not be sent (reported at the end)
+          PROBLEMS = []   # (error key, args) for things that could not be sent (reported at the end)
+          SENT_IDS = []   # Telegram message ids of everything delivered, in order (used for the duplicate cache)
+          REPORTED = [False]
+          CANCELLED = [False]
 
 
           def clear_status():
@@ -446,17 +525,120 @@ jobs:
                   pass
 
 
-          def fail(text, code=0):
+          # ---------- Worker callbacks (heartbeat / cancel / result / cookies) ----------
+          def cb_call(op, timeout=12, tries=2, **data):
+              """Talk to the Worker. Returns the JSON answer or None. Silent when the job has no callback address."""
+              if not (CB and JOB_ID and JOB_TOKEN) or (NB and op != "ck"):
+                  return None
+              body = dict(data, op=op, id=JOB_ID, jt=JOB_TOKEN)
+              for i in range(tries):
+                  try:
+                      r = requests.post(CB.rstrip("/") + "/cb", json=body, timeout=timeout)
+                      if r.ok:
+                          return r.json()
+                  except Exception as e:
+                      print("callback failed:", op, type(e).__name__)
+                  if i + 1 < tries:
+                      time.sleep(1.5)
+              return None
+
+
+          def report_done(ok, retryable=False, cancelled=False, reason=""):
+              """Tell the Worker how the job ended (frees the queue slot, fills the duplicate cache). Sent once."""
+              if REPORTED[0]:
+                  return
+              REPORTED[0] = True
+              cb_call("done", timeout=15, tries=3, ok=bool(ok), retryable=bool(retryable), cancelled=bool(cancelled),
+                      reason=str(reason)[:40], ids=SENT_IDS[:100])
+
+
+          def kill_children():
+              """SIGKILL every process started by this script (yt-dlp, ffmpeg, the tunnel...)."""
+              me = os.getpid()
+              kids = {}
+              try:
+                  names = os.listdir("/proc")
+              except OSError:
+                  return
+              for name in names:
+                  if not name.isdigit():
+                      continue
+                  try:
+                      with open("/proc/%s/stat" % name) as fh:
+                          raw = fh.read()
+                      ppid = int(raw.rsplit(")", 1)[1].split()[1])
+                  except Exception:
+                      continue
+                  kids.setdefault(ppid, []).append(int(name))
+              stack, victims = [me], []
+              while stack:
+                  for c in kids.get(stack.pop(), []):
+                      victims.append(c)
+                      stack.append(c)
+              for pid in reversed(victims):
+                  try:
+                      os.kill(pid, signal.SIGKILL)
+                  except OSError:
+                      pass
+
+
+          def cancel_now():
+              """The user pressed Cancel: stop everything, remove temp files, tell the user and the Worker."""
+              if CANCELLED[0]:
+                  return
+              CANCELLED[0] = True
+              status.frozen = True
+              kill_children()
+              try:
+                  clear_out()
+              except Exception:
+                  pass
+              try:
+                  status.finish(T["cancelled"])
+              except Exception:
+                  pass
+              report_done(False, cancelled=True, reason="cancelled")
+              mark_done()
+              print("Cancelled by the user.")
+              sys.stdout.flush()
+              os._exit(0)
+
+
+          def start_heartbeat():
+              """Every few seconds: 'I am alive' + 'has the user asked to cancel?'. The first call is immediate."""
+              if not (CB and JOB_ID and JOB_TOKEN):
+                  return
+              first = cb_call("hb", timeout=10, tries=1, run=os.environ.get("GITHUB_RUN_ID", ""))
+              if first and first.get("cancel"):
+                  cancel_now()
+
+              def loop():
+                  while True:
+                      time.sleep(HB_EVERY)
+                      r = cb_call("hb", timeout=10, tries=1, run=os.environ.get("GITHUB_RUN_ID", ""))
+                      if r and r.get("cancel"):
+                          cancel_now()
+
+              threading.Thread(target=loop, daemon=True).start()
+
+
+          def fail(text, code=0, retry=False):
               """Report to the user. code=0 for normal user-facing errors (green run), 1 for real infrastructure failures."""
-              print("FAILED:", redact(text))
-              status.finish(text)
+              print("FAILED:", redact(text).replace("\n", " | "))
+              report_done(False, retryable=retry, reason="failed")
+              status.finish(text, markup=retry_kb() if retry else None)
               mark_done()
               sys.exit(code)
+
+
+          def fail_key(key, *args, code=0):
+              fail(err_text(key, *args), code, err_retry(key))
 
 
           # ---------- Job payload ----------
           def load_job():
               global URL, CHAT, THREAD, STATUS, QUALITY, SHOW_SRC, SPOILER, UP, MODE
+              global CB, JOB_ID, JOB_TOKEN, ATTEMPT, PROG_INT, HB_EVERY, NB, RP
               if JOB:
                   try:
                       from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -473,6 +655,16 @@ jobs:
                       up = str(d.get("up", "a"))[:1]
                       UP = up if up in ("a", "b", "m") else "a"
                       MODE = "link" if d.get("m") == "link" else "download"
+                      jid = str(d.get("id", "") or "")
+                      cb = str(d.get("cb", "") or "").strip()
+                      if re.fullmatch(r"[A-Za-z0-9_-]{6,24}", jid) and cb.startswith("https://"):
+                          JOB_ID, CB, JOB_TOKEN = jid, cb, str(d.get("jt", "") or "")
+                      ATTEMPT = int(d.get("at", 0) or 0)
+                      NB = bool(d.get("nb"))
+                      rp = str(d.get("rp", "") or "")
+                      RP = rp if re.fullmatch(r"\d{1,15}", rp) else ""
+                      PROG_INT = max(4.0, min(30.0, float(d.get("pi", 7) or 7)))
+                      HB_EVERY = max(3.0, min(15.0, float(d.get("hi", 5) or 5)))
                   except Exception as e:
                       print("Could not decode the job payload:", type(e).__name__)
                       sys.exit(1)
@@ -489,6 +681,8 @@ jobs:
                       if len(v) >= 5:
                           SENSITIVE.append(v)
                           print("::add-mask::" + v)
+              if JOB_TOKEN:
+                  print("::add-mask::" + JOB_TOKEN)
               if not URL or not re.fullmatch(r"-?\d+", CHAT or ""):
                   print("Missing or invalid url/chat_id.")
                   sys.exit(1)
@@ -496,16 +690,42 @@ jobs:
                   print("Invalid thread_id/status_id.")
                   sys.exit(1)
               with open(META, "w") as fh:
-                  json.dump({"chat": CHAT, "status": STATUS}, fh)
+                  json.dump({"chat": CHAT, "status": STATUS, "cb": CB, "id": JOB_ID, "jt": JOB_TOKEN, "nb": NB}, fh)
+
+
+          def parse_cookie_lines(text):
+              """Netscape cookies.txt -> {(domain, path, name): line}. Comment lines other than #HttpOnly_ are dropped."""
+              out = {}
+              for line in str(text).splitlines():
+                  line = line.rstrip("\r\n")
+                  if not line.strip():
+                      continue
+                  if line.startswith("#") and not line.startswith("#HttpOnly_"):
+                      continue
+                  parts = line.split("\t")
+                  if len(parts) != 7:
+                      continue
+                  domain = parts[0].replace("#HttpOnly_", "", 1).lower()
+                  out[(domain, parts[2], parts[5])] = line
+              return out
 
 
           def setup_cookies():
-              """Optional: secret YTDLP_COOKIES (Netscape cookies.txt) helps with sites that block datacenter IPs."""
-              raw = os.environ.get("YTDLP_COOKIES", "").strip()
-              if not raw:
+              """Cookies help with sites that block datacenter IPs. Two optional sources, merged:
+              the secret YTDLP_COOKIES and the cookies the bot admin manages inside Telegram (the admin ones win)."""
+              base = parse_cookie_lines(os.environ.get("YTDLP_COOKIES", ""))
+              extra = {}
+              r = cb_call("ck", h=host_of(URL), tries=2)
+              if r and r.get("text"):
+                  extra = parse_cookie_lines(r["text"])
+              merged = dict(base)
+              merged.update(extra)
+              if not merged:
                   return None
+              print("cookies: %d from the secret, %d from the admin panel" % (len(base), len(extra)))
               with open(COOKIES_FILE, "w") as fh:
-                  fh.write(raw + "\n")
+                  fh.write("# Netscape HTTP Cookie File\n")
+                  fh.write("\n".join(merged.values()) + "\n")
               os.chmod(COOKIES_FILE, 0o600)
               return COOKIES_FILE
 
@@ -637,7 +857,7 @@ jobs:
                   "--restrict-filenames", "--newline", "-N", "8", "--fragment-retries", "5",
                   "--max-filesize", str(limit),
                   "--progress-template", "download:" + PRG,
-                  "--playlist-items", "1:10", "-S", sort, "--merge-output-format", "mp4",
+                  "--playlist-items", "1:%d" % MAX_ITEMS, "-S", sort, "--merge-output-format", "mp4",
                   "-o", "out/%s%%(autonumber)s.%%(ext)s" % prefix,
               ]
               if is_youtube(target):
@@ -645,7 +865,8 @@ jobs:
               cmd += ["--", target]
               p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                    text=True, errors="replace", bufsize=1)
-              ids, res = [], {"err": "", "too_big": False, "filtered": False}
+              ids, res = [], {"err": "", "too_big": False, "filtered": False, "total": 0}
+              total_items = 0
               for line in p.stdout:
                   line = line.rstrip("\n")
                   if line.startswith("PRG|"):
@@ -658,11 +879,16 @@ jobs:
                           speed, eta = num(parts[6]), num(parts[7])
                           fi, fc = num(parts[8]), num(parts[9])
                           frac = (fi / fc) if (not total and fc and fi) else None
-                          label = T["download"] + (" (%d)" % (ids.index(cur) + 1) if len(ids) > 1 else "")
+                          shown = max(total_items, len(ids))
+                          label = T["download"] + (" (%d/%d)" % (ids.index(cur) + 1, shown) if shown > 1 else "")
                           status.set(render(label, done, total, speed, eta, frac), force=(st == "finished"))
                       continue
                   # Nothing from yt-dlp is echoed to the public log: it contains post ids and links.
                   low = line.lower()
+                  mm = re.match(r"\[download\] Downloading (?:item|video) (\d+) of (\d+)", line)
+                  if mm:
+                      total_items = int(mm.group(2))
+                      res["total"] = total_items
                   if line.startswith("[Merger]") or line.startswith("[VideoRemuxer]"):
                       status.set(render(T["merge"]), force=True)
                   if "larger than max-filesize" in low:
@@ -721,14 +947,84 @@ jobs:
               return got, err, {"oversize": big_seen, "filtered": False}
 
 
+          # ---------- Safe HTTP for the fallbacks (SSRF protection) ----------
+          # Everything the fallbacks fetch comes from third-party pages, so every address (and every redirect hop) must
+          # be a public internet address: never localhost, a private network or the cloud metadata service.
+          MAX_HOPS = 5
+          MAX_PAGE = 8 * MB
+
+
+          def host_is_public(host):
+              host = (host or "").strip("[]")
+              try:
+                  return ipaddress.ip_address(host).is_global
+              except ValueError:
+                  pass
+              try:
+                  infos = socket.getaddrinfo(host, None)
+              except OSError:
+                  return False
+              if not infos:
+                  return False
+              for info in infos:
+                  try:
+                      if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                          return False
+                  except ValueError:
+                      return False
+              return True
+
+
+          def safe_url(u):
+              try:
+                  p = urlparse(u)
+                  port = p.port
+              except ValueError:
+                  return False
+              if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
+                  return False
+              if port not in (None, 80, 443):
+                  return False
+              return host_is_public(p.hostname)
+
+
+          def http_get(url, headers=None, timeout=30, proxies=None, stream=False, impersonate=False):
+              """GET that follows redirects by hand and checks each hop. Returns (response, final url) or (None, url)."""
+              cur = url
+              for _ in range(MAX_HOPS + 1):
+                  if not safe_url(cur):
+                      print("blocked an address that is not public")
+                      return None, cur
+                  if impersonate:
+                      from curl_cffi import requests as cr
+                      r = cr.get(cur, impersonate="chrome", timeout=timeout, headers=headers, proxies=proxies,
+                                 allow_redirects=False)
+                  else:
+                      r = requests.get(cur, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=False,
+                                       stream=stream)
+                  loc = r.headers.get("location")
+                  if r.status_code in (301, 302, 303, 307, 308) and loc:
+                      if stream:
+                          r.close()
+                      cur = urljoin(cur, loc)
+                      continue
+                  return r, cur
+              print("too many redirects")
+              return None, cur
+
+
           # ---------- HTTP helpers for the fallbacks ----------
           def fetch_file(url, path, label, image_only=False, video=False, referer=None, use_proxy=False):
               """Stream a URL to disk while updating the progress bar. Returns True on success."""
               headers = dict(UA)
               if referer:
                   headers["Referer"] = referer
+              limit = size_limit()
               try:
-                  with requests.get(url, headers=headers, stream=True, timeout=60, proxies=proxies_for(use_proxy)) as resp:
+                  resp, _ = http_get(url, headers=headers, timeout=60, proxies=proxies_for(use_proxy), stream=True)
+                  if resp is None:
+                      return False
+                  with resp:
                       if resp.status_code != 200:
                           return False
                       ctype = resp.headers.get("content-type", "")
@@ -737,16 +1033,28 @@ jobs:
                       if video and ctype.startswith("text/"):
                           return False
                       total = int(resp.headers.get("content-length") or 0) or None
+                      if total and total > limit:
+                          print("download refused: file is over the size limit")
+                          return False
                       done, t0 = 0, time.time()
                       with open(path, "wb") as fh:
                           for chunk in resp.iter_content(1 << 20):
                               fh.write(chunk)
                               done += len(chunk)
+                              if done > limit:
+                                  print("download stopped: file is over the size limit")
+                                  fh.close()
+                                  os.remove(path)
+                                  return False
                               sp = done / max(time.time() - t0, 0.001)
                               status.set(render(label, done, total, sp, ((total - done) / sp) if total else None))
                   return True
               except Exception as e:
                   print("download failed:", type(e).__name__)
+                  try:
+                      os.remove(path)
+                  except OSError:
+                      pass
                   return False
 
 
@@ -760,18 +1068,18 @@ jobs:
               px = proxies_for(use_proxy)
               if impersonate:
                   try:
-                      from curl_cffi import requests as cr
-                      r = cr.get(url, impersonate="chrome", timeout=timeout, headers=hdrs, proxies=px, allow_redirects=True)
-                      return r.status_code, r.text, str(r.url)
+                      import curl_cffi  # noqa: F401
                   except ImportError:
-                      pass
-                  except Exception as e:
-                      print("page fetch failed:", type(e).__name__)
-                      return 0, "", url
-              hdrs.setdefault("User-Agent", BROWSER_UA)
+                      impersonate = False
+              if not impersonate:
+                  hdrs.setdefault("User-Agent", BROWSER_UA)
               try:
-                  r = requests.get(url, headers=hdrs, timeout=timeout, proxies=px, allow_redirects=True)
-                  return r.status_code, r.text, r.url
+                  r, final = http_get(url, headers=hdrs, timeout=timeout, proxies=px, impersonate=impersonate)
+                  if r is None:
+                      return 0, "", url
+                  if int(r.headers.get("content-length") or 0) > MAX_PAGE:
+                      return r.status_code, "", final
+                  return r.status_code, r.text[:MAX_PAGE], final
               except Exception as e:
                   print("page fetch failed:", type(e).__name__)
                   return 0, "", url
@@ -779,9 +1087,9 @@ jobs:
 
           def json_get(url, use_proxy=False):
               try:
-                  r = requests.get(url, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"}, timeout=30,
-                                   proxies=proxies_for(use_proxy))
-                  if r.status_code != 200:
+                  r, _ = http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"}, timeout=30,
+                                  proxies=proxies_for(use_proxy))
+                  if r is None or r.status_code != 200 or int(r.headers.get("content-length") or 0) > MAX_PAGE:
                       return None
                   return r.json()
               except Exception as e:
@@ -819,7 +1127,7 @@ jobs:
                   if d:
                       found = [(it.get("url"), "photo" if it.get("type") == "image" else "video")
                                for it in (d.get("media_extended") or []) if it.get("url")]
-              return [{"url": u, "kind": "photo" if k == "photo" else "video"} for u, k in found[:10]]
+              return [{"url": u, "kind": "photo" if k == "photo" else "video"} for u, k in found[:MAX_ITEMS]]
 
 
           def pinterest_items(use_proxy):
@@ -856,7 +1164,7 @@ jobs:
                       data = json.loads(m.group(1))
                       item = (((data.get("__DEFAULT_SCOPE__") or {}).get("webapp.video-detail") or {})
                               .get("itemInfo") or {}).get("itemStruct") or {}
-                      for im in ((item.get("imagePost") or {}).get("images") or [])[:10]:
+                      for im in ((item.get("imagePost") or {}).get("images") or [])[:MAX_ITEMS]:
                           urls = (im.get("imageURL") or {}).get("urlList") or []
                           if urls:
                               out.append({"url": urls[0], "kind": "photo", "referer": "https://www.tiktok.com/"})
@@ -869,7 +1177,7 @@ jobs:
               data = (d or {}).get("data") or {}
               fix = lambda u: ("https://www.tikwm.com" + u) if str(u).startswith("/") else u
               if data.get("images"):
-                  return [{"url": fix(u), "kind": "photo"} for u in data["images"][:10]]
+                  return [{"url": fix(u), "kind": "photo"} for u in data["images"][:MAX_ITEMS]]
               play = data.get("hdplay") or data.get("play")
               return [{"url": fix(play), "kind": "video"}] if play else []
 
@@ -901,7 +1209,7 @@ jobs:
                       add(mm.group(1))
                   if urls:
                       break
-              return [{"url": u, "kind": "photo", "referer": "https://www.instagram.com/"} for u in urls[:10]]
+              return [{"url": u, "kind": "photo", "referer": "https://www.instagram.com/"} for u in urls[:MAX_ITEMS]]
 
 
           def reddit_media_from_post(p):
@@ -911,7 +1219,7 @@ jobs:
               if p.get("is_gallery") and p.get("media_metadata"):
                   order = [i.get("media_id") for i in ((p.get("gallery_data") or {}).get("items") or [])] or list(p["media_metadata"])
                   out = []
-                  for mid in order[:10]:
+                  for mid in order[:MAX_ITEMS]:
                       md = p["media_metadata"].get(mid) or {}
                       if md.get("status", "valid") != "valid":
                           continue
@@ -1050,30 +1358,32 @@ jobs:
           def download_one(it, idx, use_proxy):
               kind, ref = it.get("kind"), it.get("referer")
               if kind == "stream":
-                  prefix = "s%d_" % idx
+                  prefix = "i%03d_" % idx
                   ytdlp(sort_for(LADDER[START.get(QUALITY, 0)]), size_limit(), url=it["url"], referer=ref,
                         use_proxy=use_proxy, prefix=prefix)
                   return [f for f in files() if os.path.basename(f).startswith(prefix)]
               ext = os.path.splitext(urlparse(it["url"]).path)[1].lower()
               if ext not in VIDEO_EXT + PHOTO_EXT + (".gif",):
                   ext = ".jpg" if kind == "photo" else ".mp4"
-              path = "out/it_%d%s" % (idx, ext)
+              path = "out/i%03d%s" % (idx, ext)
               if not fetch_file(it["url"], path, T["download"], image_only=(kind == "photo"), video=(kind == "video"),
                                 referer=ref, use_proxy=use_proxy):
                   return []
               if it.get("audio"):
-                  apath = "out/it_%d_audio.m4a" % idx
-                  merged = "out/it_%d_merged.mp4" % idx
+                  apath = "out/i%03d_audio.m4a" % idx
+                  merged = "out/i%03d_merged.mp4" % idx
                   if fetch_file(it["audio"], apath, T["download"], referer=ref, use_proxy=use_proxy) and mux_av(path, apath, merged):
                       os.remove(path)
                       os.remove(apath)
                       return [merged]
+                  if os.path.exists(apath):
+                      os.remove(apath)   # the muxing failed: never send the loose audio track as a file
               return [path]
 
 
           def download_items(items, use_proxy):
               out = []
-              for i, it in enumerate(items[:10]):
+              for i, it in enumerate(items[:MAX_ITEMS]):
                   got = download_one(it, i, use_proxy)
                   for alt in it.get("alts") or []:
                       if got:
@@ -1083,7 +1393,7 @@ jobs:
               return out
 
 
-          # ---------- Bot API upload (small files) ----------
+          # ---------- Media checks ----------
           def probe(path):
               try:
                   p = subprocess.run(
@@ -1099,17 +1409,85 @@ jobs:
                   return 0, 0, 0
 
 
+          def valid_media(path):
+              """Cheap sanity check so that an error page saved as .jpg or an empty file is never sent to Telegram."""
+              try:
+                  size = os.path.getsize(path)
+                  with open(path, "rb") as fh:
+                      head = fh.read(16)
+              except OSError:
+                  return False
+              if size < 200:
+                  return False
+              ext = os.path.splitext(path)[1].lower()
+              if ext in PHOTO_EXT or ext == ".gif":
+                  return (head.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF8"))
+                          or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"))
+              if ext in VIDEO_EXT:
+                  if head.lstrip()[:1] in (b"<", b"{"):
+                      return False
+                  return head[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip") or head[:4] == b"\x1a\x45\xdf\xa3"
+              return True
+
+
+          def photo_ok(path):
+              """Telegram sends a file as a photo only up to 10 MB, 10000 px (width + height) and a 1:20 aspect ratio."""
+              if os.path.getsize(path) > 10 * MB:
+                  return False
+              _, w, h = probe(path)
+              if not w or not h:
+                  return True   # unknown: let Telegram decide (a failed photo falls back to a document)
+              return (w + h) <= 10000 and max(w, h) <= 20 * min(w, h)
+
+
+          def album_ok(path):
+              ext = os.path.splitext(path)[1].lower()
+              if ext in VIDEO_EXT:
+                  return True
+              return ext in PHOTO_EXT and photo_ok(path)
+
+
+          # ---------- Bot API upload ----------
+          def api_post(method, data, files=None, timeout=300):
+              """POST to the Bot API and wait out a flood limit (429) up to twice. Returns the parsed answer (ok False on failure)."""
+              for attempt in range(3):
+                  try:
+                      r = requests.post(API + "/" + method, data=data, files=files, timeout=timeout)
+                      j = r.json()
+                  except Exception as e:
+                      print("send error:", method, type(e).__name__)
+                      return {"ok": False}
+                  if j.get("ok"):
+                      return j
+                  if r.status_code == 429 and attempt < 2:
+                      wait = int((j.get("parameters") or {}).get("retry_after", 5))
+                      if wait <= 60:
+                          print("telegram flood limit, waiting", wait, "s")
+                          time.sleep(wait + 1)
+                          for fh in (files or {}).values():
+                              try:
+                                  fh.seek(0)
+                              except Exception:
+                                  pass
+                          continue
+                  print("send failed:", method, r.status_code, redact(str(j)[:300]))
+                  return j
+              return {"ok": False}
+
+
           def api_send_one(path, caption):
+              """Returns the list of message ids that were created ([] on failure)."""
               ext = os.path.splitext(path)[1].lower()
               if ext in VIDEO_EXT:
                   method, field = "sendVideo", "video"
               elif ext == ".gif":
                   method, field = "sendAnimation", "animation"
-              elif ext in PHOTO_EXT:
+              elif ext in PHOTO_EXT and photo_ok(path):
                   method, field = "sendPhoto", "photo"
               else:
                   method, field = "sendDocument", "document"
-              for m, fld in ((method, field), ("sendDocument", "document")):
+              attempts = [(method, field)] + ([("sendDocument", "document")] if method != "sendDocument" else [])
+              for m, fld in attempts:
                   data = {"chat_id": CHAT}
                   data.update(thread_args())
                   if caption:
@@ -1123,29 +1501,17 @@ jobs:
                           data["duration"] = str(dur)
                       if w and h:
                           data["width"], data["height"] = str(w), str(h)
-                  try:
-                      with open(path, "rb") as fh:
-                          r = requests.post(API + "/" + m, data=data, files={fld: fh}, timeout=300)
-                      if r.ok and r.json().get("ok"):
-                          return True
-                      print("send failed:", m, r.status_code, redact(r.text[:300]))
-                  except Exception as e:
-                      print("send error:", m, type(e).__name__)
-                  if m == "sendDocument":
-                      break
+                  with open(path, "rb") as fh:
+                      j = api_post(m, data, {fld: fh}, 300)
+                  if j.get("ok"):
+                      return [j["result"]["message_id"]]
               STATE["send_failed"] = True
-              return False
-
-
-          def album_ok(path):
-              ext = os.path.splitext(path)[1].lower()
-              if ext in VIDEO_EXT:
-                  return True
-              return ext in PHOTO_EXT and os.path.getsize(path) <= 10 * MB
+              return []
 
 
           def api_send_album(paths, caption):
-              media, fhs, handles = [], {}, []
+              """One Telegram media group (2 to 10 photos/videos). Returns the message ids in order ([] on failure)."""
+              media, fhs = [], {}
               try:
                   for i, p in enumerate(paths):
                       is_video = os.path.splitext(p)[1].lower() in VIDEO_EXT
@@ -1160,54 +1526,74 @@ jobs:
                       if i == 0 and caption:
                           item["caption"], item["parse_mode"] = caption, "HTML"
                       media.append(item)
-                      fh = open(p, "rb")
-                      handles.append(fh)
-                      fhs["f%d" % i] = fh
+                      fhs["f%d" % i] = open(p, "rb")
                   data = {"chat_id": CHAT, "media": json.dumps(media)}
                   data.update(thread_args())
-                  r = requests.post(API + "/sendMediaGroup", data=data, files=fhs, timeout=900)
-                  if r.ok and r.json().get("ok"):
-                      return True
-                  print("album failed:", r.status_code, redact(r.text[:300]))
+                  j = api_post("sendMediaGroup", data, fhs, 900)
+                  if j.get("ok"):
+                      return [m["message_id"] for m in j["result"]]
               except Exception as e:
                   print("album error:", type(e).__name__)
               finally:
-                  for fh in handles:
+                  for fh in fhs.values():
                       fh.close()
-              return False
+              return []
 
 
-          def send_small(paths, cap):
-              sent, rest = 0, list(paths)
-              eligible = [p for p in paths if album_ok(p)]
-              if len(eligible) >= 2 and sum(os.path.getsize(p) for p in eligible) <= ALBUM_MAX_TOTAL:
-                  status.set(render(T["upload"]), force=True)
-                  if api_send_album(eligible, cap.get()):
-                      cap.done()
-                      sent += len(eligible)
-                      rest = [p for p in paths if p not in eligible]
-                  # on failure everything is sent one by one below (the caption is still available)
-              for i, p in enumerate(rest, 1):
-                  status.set(render(T["upload"] + (" (%d/%d)" % (i, len(rest)) if len(rest) > 1 else "")), force=True)
-                  if api_send_one(p, cap.get()):
-                      cap.done()
-                      sent += 1
-              return sent
+          def goes_mt(path):
+              return os.path.getsize(path) > BOT_LIMIT or (UP == "m" and MT_OK)
+
+
+          def plan_segments(paths):
+              """Split the files (kept in their original order) into things that are sent together:
+              ("album", [paths])  one Telegram media group (2-10 items, photos/videos that fit the Bot API)
+              ("one", path, via_mtproto)  a single file."""
+              segs, cur, cur_size = [], [], 0
+
+              def flush():
+                  nonlocal cur, cur_size
+                  if len(cur) >= 2:
+                      segs.append(("album", cur))
+                  elif cur:
+                      segs.append(("one", cur[0], False))
+                  cur, cur_size = [], 0
+
+              for p in paths:
+                  if goes_mt(p):
+                      flush()
+                      segs.append(("one", p, True))
+                      continue
+                  if not album_ok(p):
+                      flush()
+                      segs.append(("one", p, False))
+                      continue
+                  size = os.path.getsize(p)
+                  if len(cur) >= 10 or (cur and cur_size + size > ALBUM_MAX_TOTAL):
+                      flush()
+                  cur.append(p)
+                  cur_size += size
+              flush()
+              return segs
+
+
+          def upload_label(done, total):
+              return T["upload"] + (" (%d/%d)" % (min(done + 1, total), total) if total > 1 else "")
 
 
           # ---------- MTProto upload (large files, up to about 2 GB) ----------
           def make_thumb(path):
               t = path + ".thumb.jpg"
-              try:
-                  r = subprocess.run(
-                      ["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", path,
-                       "-frames:v", "1", "-vf", "scale=320:-2", t],
-                      capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
-                  )
-                  if r.returncode == 0 and os.path.exists(t):
-                      return t
-              except Exception:
-                  pass
+              for ss in ("1", "0"):
+                  try:
+                      r = subprocess.run(
+                          ["ffmpeg", "-y", "-loglevel", "error", "-ss", ss, "-i", path,
+                           "-frames:v", "1", "-vf", "scale=320:-2", t],
+                          capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
+                      )
+                      if r.returncode == 0 and os.path.exists(t):
+                          return t
+                  except Exception:
+                      pass
               return None
 
 
@@ -1232,6 +1618,7 @@ jobs:
 
 
           def prepare_big(path):
+              """Files over the MTProto limit are split into parts when they are videos; anything else is refused."""
               size = os.path.getsize(path)
               if size <= MT_LIMIT:
                   return [path]
@@ -1241,7 +1628,7 @@ jobs:
                   if pieces and all(os.path.getsize(p) <= MT_LIMIT for p in pieces):
                       notify(T["split_note"] % len(pieces))
                       return pieces
-              PROBLEMS.append(T["over_2gb"])
+              PROBLEMS.append(("over2gb",))
               return []
 
 
@@ -1291,99 +1678,249 @@ jobs:
                   return await client.get_input_entity(cid)
 
 
-          async def mtproto_send(paths, cap):
+          async def _sender_call(client, sender, request):
+              fn = getattr(client, "_call", None)
+              if fn is not None:
+                  return await fn(sender, request)
+              return await sender.send(request)
+
+
+          async def parallel_upload(client, path, progress):
+              """Telethon uploads a file over ONE connection, which is slow. Here the parts of a big file are sent over
+              several connections at once (to the same data center, same login) and the finished upload is handed to
+              send_file. Returns an InputFileBig, or None when this isn't possible; the caller then uses the normal upload.
+              Uses a few internal Telethon calls, so every failure ends in the normal upload, never in a failed job."""
+              size = os.path.getsize(path)
+              if MT_CONNS < 2 or size < 10 * MB:
+                  return None
+              try:
+                  from telethon.network import MTProtoSender
+                  from telethon.tl.functions.upload import SaveBigFilePartRequest
+                  from telethon.tl.types import InputFileBig
+              except Exception as e:
+                  print("parallel upload unavailable:", type(e).__name__)
+                  return None
+              part_size = 512 * 1024
+              parts = (size + part_size - 1) // part_size
+              if parts > 4000:
+                  return None
+              want = max(2, min(MT_CONNS, size // (6 * MB)))
+              file_id = int.from_bytes(os.urandom(8), "big", signed=True)
+              senders, tasks, fd = [], [], None
+              t0 = time.time()
+              try:
+                  dc = await client._get_dc(client.session.dc_id)
+
+                  async def make():
+                      s = MTProtoSender(client.session.auth_key, loggers=client._log)
+                      kw = {"loggers": client._log, "proxy": getattr(client, "_proxy", None)}
+                      if getattr(client, "_local_addr", None):
+                          kw["local_addr"] = client._local_addr
+                      await s.connect(client._connection(dc.ip_address, dc.port, dc.id, **kw))
+                      return s
+
+                  made = await asyncio.wait_for(asyncio.gather(*[make() for _ in range(want)], return_exceptions=True), 40)
+                  senders = [s for s in made if not isinstance(s, BaseException)]
+                  if len(senders) < 2:
+                      raise RuntimeError("could not open extra connections")
+                  fd = os.open(path, os.O_RDONLY)
+                  sent = [0]
+
+                  async def worker(i, sender):
+                      for idx in range(i, parts, len(senders)):
+                          data = os.pread(fd, part_size, idx * part_size)
+                          req = SaveBigFilePartRequest(file_id, idx, parts, data)
+                          for attempt in range(4):
+                              try:
+                                  await _sender_call(client, sender, req)
+                                  break
+                              except asyncio.CancelledError:
+                                  raise
+                              except Exception:
+                                  if attempt == 3:
+                                      raise
+                                  await asyncio.sleep(1 + attempt)
+                          sent[0] += len(data)
+                          progress(sent[0], size)
+
+                  tasks = [asyncio.ensure_future(worker(i, s)) for i, s in enumerate(senders)]
+                  await asyncio.gather(*tasks)
+                  took = max(time.time() - t0, 0.001)
+                  print("parallel upload: %.1f MB in %.1fs = %.2f MB/s over %d connections"
+                        % (size / MB, took, size / MB / took, len(senders)))
+                  return InputFileBig(file_id, parts, os.path.basename(path))
+              except Exception as e:
+                  print("parallel upload failed, using the normal upload:", type(e).__name__)
+                  for t in tasks:
+                      t.cancel()
+                  if tasks:
+                      await asyncio.gather(*tasks, return_exceptions=True)
+                  return None
+              finally:
+                  if fd is not None:
+                      os.close(fd)
+                  for s in senders:
+                      try:
+                          await s.disconnect()
+                      except Exception:
+                          pass
+
+
+          async def mt_send_one(client, peer, path, label, cap):
+              """Send one file over MTProto. Returns the list of created message ids ([] on failure)."""
+              from telethon.tl.types import DocumentAttributeVideo
+              loop = asyncio.get_running_loop()
+              ext = os.path.splitext(path)[1].lower()
+              kwargs = {}
+              if ext in VIDEO_EXT:
+                  dur, w, h = probe(path)
+                  kwargs["attributes"] = [DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)]
+                  thumb = make_thumb(path)
+                  if thumb:
+                      kwargs["thumb"] = thumb
+                  if SPOILER:
+                      kwargs["spoiler"] = True
+              elif ext in PHOTO_EXT:
+                  if os.path.getsize(path) > 10 * MB:
+                      kwargs["force_document"] = True
+                  elif SPOILER:
+                      kwargs["spoiler"] = True
+              elif ext == ".gif":
+                  if SPOILER:
+                      kwargs["spoiler"] = True
+              else:
+                  kwargs["force_document"] = True
+              caption = cap.get()
+              if caption:
+                  kwargs["caption"], kwargs["parse_mode"] = caption, "html"
+              reply_to = int(RP) if RP else (int(THREAD) if THREAD else None)
+              t0, last = time.time(), [0.0]
+
+              def cb(cur, total):
+                  now = time.time()
+                  if now - last[0] < 1.0:
+                      return
+                  last[0] = now
+                  sp = cur / max(now - t0, 0.001)
+                  loop.run_in_executor(None, status.set, render(label, cur, total, sp, ((total - cur) / sp) if sp else None))
+
+              async def send(src):
+                  try:
+                      return await client.send_file(peer, src, reply_to=reply_to, progress_callback=cb, **kwargs)
+                  except TypeError:
+                      kwargs.pop("spoiler", None)
+                      return await client.send_file(peer, src, reply_to=reply_to, progress_callback=cb, **kwargs)
+
+              handle = await parallel_upload(client, path, cb)
+              try:
+                  msg = await send(handle if handle is not None else path)
+              except Exception as e:
+                  if handle is None:
+                      raise
+                  print("sending the parallel upload failed:", type(e).__name__, "- using the normal upload")
+                  msg = await send(path)
+              if handle is None:
+                  took = max(time.time() - t0, 0.001)
+                  print("mtproto upload: %.1f MB in %.1fs = %.2f MB/s (single connection)"
+                        % (os.path.getsize(path) / MB, took, os.path.getsize(path) / MB / took))
+              return [m.id for m in (msg if isinstance(msg, list) else [msg])]
+
+
+          # ---------- Send everything, in the original order ----------
+          def send_bot_segment(seg, cap):
+              """Returns (files sent, message ids). An album that fails is retried file by file."""
+              if seg[0] == "album":
+                  ids = api_send_album(seg[1], cap.get())
+                  if ids:
+                      cap.done()
+                      return len(seg[1]), ids
+                  n, out = 0, []
+                  for p in seg[1]:
+                      got = api_send_one(p, cap.get())
+                      if got:
+                          cap.done()
+                          n += 1
+                          out += got
+                  return n, out
+              ids = api_send_one(seg[1], cap.get())
+              if ids:
+                  cap.done()
+              return (1 if ids else 0), ids
+
+
+          def send_all(paths, cap):
+              """Returns (sent, attempted). SENT_IDS receives the id of every message that was created, in order."""
+              segs = plan_segments(paths)
+              total = sum(len(s[1]) if s[0] == "album" else 1 for s in segs)
+              sent = 0
+              if not any(s[0] == "one" and s[2] for s in segs):
+                  for seg in segs:
+                      status.set(render(upload_label(sent, total)), force=True)
+                      n, ids = send_bot_segment(seg, cap)
+                      sent += n
+                      SENT_IDS.extend(ids)
+                  return sent, total
+              return asyncio.run(send_all_async(segs, cap, total))
+
+
+          async def send_all_async(segs, cap, total):
               from telethon import TelegramClient
               from telethon.sessions import StringSession
-              from telethon.tl.types import DocumentAttributeVideo
-
-              client = TelegramClient(StringSession(), int(API_ID), API_HASH)
-              await client.start(bot_token=TOKEN)
               loop = asyncio.get_running_loop()
+              client = None
+              peer = None
               sent = 0
               try:
-                  peer = await resolve_peer(client)
-                  reply_to = int(THREAD) if THREAD else None
-                  for idx, path in enumerate(paths, 1):
-                      ext = os.path.splitext(path)[1].lower()
-                      kwargs = {}
-                      if ext in VIDEO_EXT:
-                          dur, w, h = probe(path)
-                          kwargs["attributes"] = [DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)]
-                          thumb = make_thumb(path)
-                          if thumb:
-                              kwargs["thumb"] = thumb
-                          if SPOILER:
-                              kwargs["spoiler"] = True
-                      elif ext in PHOTO_EXT:
-                          if os.path.getsize(path) > 10 * MB:
-                              kwargs["force_document"] = True
-                          elif SPOILER:
-                              kwargs["spoiler"] = True
-                      elif ext == ".gif":
-                          if SPOILER:
-                              kwargs["spoiler"] = True
-                      else:
-                          kwargs["force_document"] = True
-
-                      label = T["upload"] + (" (%d/%d)" % (idx, len(paths)) if len(paths) > 1 else "")
-                      t0, last = time.time(), [0.0]
-
-                      def cb(cur, total, label=label, t0=t0, last=last):
-                          now = time.time()
-                          if now - last[0] < 1.0:
-                              return
-                          last[0] = now
-                          sp = cur / max(now - t0, 0.001)
-                          text = render(label, cur, total, sp, ((total - cur) / sp) if sp else None)
-                          loop.run_in_executor(None, status.set, text)
-
-                      caption = cap.get()
-                      if caption:
-                          kwargs["caption"], kwargs["parse_mode"] = caption, "html"
-                      try:
+                  for seg in segs:
+                      label = upload_label(sent, total)
+                      status.set(render(label), force=True)
+                      if seg[0] == "one" and seg[2]:
                           try:
-                              await client.send_file(peer, path, reply_to=reply_to, progress_callback=cb, **kwargs)
-                          except TypeError:
-                              kwargs.pop("spoiler", None)
-                              await client.send_file(peer, path, reply_to=reply_to, progress_callback=cb, **kwargs)
-                          sent += 1
+                              if client is None:
+                                  client = TelegramClient(StringSession(), int(API_ID), API_HASH, receive_updates=False)
+                                  await client.start(bot_token=TOKEN)
+                                  peer = await resolve_peer(client)
+                              ids = await mt_send_one(client, peer, seg[1], label, cap)
+                          except Exception as e:
+                              print("mtproto send failed:", type(e).__name__, redact(str(e))[:300])
+                              STATE["send_failed"] = True
+                              PROBLEMS.append(("bigfail",))
+                              continue
                           cap.done()
-                      except Exception as e:
-                          print("mtproto send failed:", type(e).__name__, redact(str(e))[:300])
-                          STATE["send_failed"] = True
-                          PROBLEMS.append(T["big_failed"] % type(e).__name__)
+                          sent += 1
+                          SENT_IDS.extend(ids)
+                      else:
+                          n, ids = await loop.run_in_executor(None, send_bot_segment, seg, cap)
+                          sent += n
+                          SENT_IDS.extend(ids)
               finally:
-                  await client.disconnect()
-              return sent
+                  if client is not None:
+                      try:
+                          await client.disconnect()
+                      except Exception:
+                          pass
+              return sent, total
 
 
           # ---------- Friendly errors ----------
-          FRIENDLY = [
-              (r"not a bot|sign in to confirm",
-               "The site is asking this server for verification. Try again later."),
-              (r"private|log ?in|logged|sign ?in|cookies|authenticat|confirm your age|age.?restrict|empty media response|accessible in your browser",
-               "It may be private, age-restricted, or need a login."),
-              (r"429|rate.?limit|too many requests|try again later|403|forbidden|blocked",
-               "The site is limiting requests right now. Try again in a few minutes."),
-              (r"not available|unavailable|removed|deleted|does not exist|no longer|not found|404|410",
-               "The post may have been deleted or isn't available."),
-              (r"geo|country|region|your location",
-               "It isn't available in your region."),
-              (r"no video|no media|unsupported url|there is no|no formats",
-               "No downloadable media was found."),
+          # Order matters: the first matching rule wins. Raw yt-dlp text never reaches the user.
+          ERROR_RULES = [
+              (r"not a bot|sign in to confirm", "verify"),
+              (r"geo.?restrict|in your country|in your region|your location|country", "geo"),
+              (r"429|rate.?limit|too many requests|try again later|403|forbidden|blocked|network security|captcha", "limited"),
+              (r"private|log ?in|logged|sign ?in|cookies|authenticat|confirm your age|age.?restrict|empty media response|accessible in your browser", "login"),
+              (r"not available|unavailable|removed|deleted|does not exist|no longer|not found|404|410", "gone"),
+              (r"no video|no media|unsupported url|there is no|no formats", "nomedia"),
           ]
 
 
-          def friendly_error(err):
-              if not err:
-                  return T["unknown_error"]
-              safe = redact(err)
-              low = safe.lower()
-              for pat, msg in FRIENDLY:
+          def classify_error(err):
+              """Maps the last yt-dlp error line to a key of ERR."""
+              low = redact(err or "").lower()
+              for pat, key in ERROR_RULES:
                   if re.search(pat, low):
-                      return msg
-              safe = re.sub(r";?\s*please report this issue.*", "", safe, flags=re.I).replace("ERROR: ", "", 1)
-              return safe[:140]
+                      return key
+              return "unknown"
 
 
           # ---------- Acquire media (shared by download and link modes) ----------
@@ -1419,7 +1956,7 @@ jobs:
           def ytdlp_links(use_proxy):
               """Ask yt-dlp for direct media URLs without downloading. Returns (items, error line)."""
               cmd = base_cmd(URL, use_proxy) + [
-                  "-J", "--playlist-items", "1:10", "-f", "b[protocol^=http]/b/bv*+ba",
+                  "-J", "--playlist-items", "1:%d" % MAX_ITEMS, "-f", "b[protocol^=http]/b/bv*+ba",
                   "-S", sort_for(LADDER[START.get(QUALITY, 0)]), "--", URL,
               ]
               try:
@@ -1454,7 +1991,7 @@ jobs:
                       items.append({"url": e["url"], "kind": "stream" if "m3u8" in proto or "dash" in proto else "video"})
                   elif fmts:
                       items.append({"url": fmts[0].get("url"), "kind": "video"})
-              return [i for i in items if i.get("url")][:10], err
+              return [i for i in items if i.get("url")][:MAX_ITEMS], err
 
 
           def format_links(items):
@@ -1503,11 +2040,12 @@ jobs:
               if not items:
                   items = resolve_fallback(used_proxy)
               if not items:
-                  fail(T["dl_failed"] % friendly_error(err))
+                  fail_key(classify_error(err))
               if not send_blocks(format_links(items)):
                   STATE["send_failed"] = True
-                  fail(T["send_failed"], 1)
+                  fail_key("send", code=1)
               clear_status()
+              report_done(True)
               mark_done()
               print("Done, links:", len(items))
 
@@ -1517,49 +2055,55 @@ jobs:
               got, last_err, fl = acquire(limit)
               if not got:
                   if fl["filtered"]:
-                      fail(T["too_long"] % YT_MAX_MIN)
+                      fail_key("toolong", YT_MAX_MIN)
                   if fl["oversize"]:
-                      fail(T["too_big_botapi"] if UP == "b" else T["too_big"])
-                  fail(T["dl_failed"] % friendly_error(last_err))
+                      fail_key("toobig_botapi" if UP == "b" else "toobig")
+                  fail_key(classify_error(last_err))
+
+              cut = len(got) > MAX_ITEMS
+              candidates = [f for f in got[:MAX_ITEMS] if valid_media(f)]
+              if not candidates:
+                  fail_key("nomedia")
 
               cap = Caption(source_caption())
 
-              small, big = [], []
-              for f in got[:10]:
-                  if os.path.getsize(f) > BOT_LIMIT or (UP == "m" and MT_OK):
-                      big.append(f)
-                  else:
-                      small.append(f)
-
-              attempted = len(small)
-              sent = send_small(small, cap) if small else 0
-
-              if big:
+              # Files that need the large-file route: refuse them when it isn't available (the rest is still sent).
+              if any(goes_mt(f) for f in candidates):
                   if not mt_on():
-                      PROBLEMS.append(T["botapi_only"] if UP == "b" else T["no_big_upload"])
+                      PROBLEMS.append(("toobig_botapi",) if UP == "b" else ("nobig",))
+                      candidates = [f for f in candidates if not goes_mt(f)]
                   elif not ensure_telethon():
-                      PROBLEMS.append(T["big_unavailable"])
+                      PROBLEMS.append(("bigunavail",))
                       STATE["send_failed"] = True
-                  else:
-                      expanded = []
-                      for f in big:
-                          expanded += prepare_big(f)
-                      attempted += len(expanded)
-                      if expanded:
-                          try:
-                              sent += asyncio.run(mtproto_send(expanded, cap))
-                          except Exception as e:
-                              print("mtproto failed:", type(e).__name__, redact(str(e))[:300])
-                              STATE["send_failed"] = True
-                              PROBLEMS.append(T["big_failed"] % type(e).__name__)
+                      candidates = [f for f in candidates if not goes_mt(f)]
+              to_send = []
+              for f in candidates:
+                  to_send += prepare_big(f) if os.path.getsize(f) > MT_LIMIT else [f]
+
+              attempted = len(to_send)
+              sent = 0
+              if to_send:
+                  try:
+                      sent, _ = send_all(to_send, cap)
+                  except Exception as e:
+                      print("sending failed:", type(e).__name__, redact(str(e))[:300])
+                      STATE["send_failed"] = True
+                      PROBLEMS.append(("bigfail",))
 
               if sent == 0:
-                  fail(PROBLEMS[-1] if PROBLEMS else T["send_failed"],
-                       1 if (STATE["send_failed"] or not PROBLEMS) else 0)
+                  key = PROBLEMS[-1][0] if PROBLEMS else "send"
+                  fail_key(key, code=1 if (STATE["send_failed"] or not PROBLEMS) else 0)
+              clean = not PROBLEMS and sent == attempted
+              notes = []
               if PROBLEMS:
-                  notify(PROBLEMS[-1])
-              elif attempted and sent < attempted:
-                  notify(T["partial"] % (sent, attempted))
+                  notes.append(err_text(*PROBLEMS[-1]))
+              elif sent < attempted:
+                  notes.append(T["partial"] % (sent, attempted))
+              if cut:
+                  notes.append(T["cut_note"] % MAX_ITEMS)
+              report_done(True, reason="ok" if clean else "partial")
+              if notes:
+                  notify("\n\n".join(notes))
               clear_status()
               mark_done()
               print("Done, sent:", sent)
@@ -1568,14 +2112,19 @@ jobs:
           def main():
               load_job()
               if not ALLOWED.match(URL):
-                  fail(T["unsupported"])
+                  fail_key("unsupported")
               os.makedirs("out", exist_ok=True)
+              start_heartbeat()
               setup_cookies()
-              print("yt-dlp version:", ytdlp_version(), "| mode:", MODE, "| upload:", UP, "| spoiler:", SPOILER)
-              if MODE == "link":
-                  run_link()
-              else:
-                  run_download()
+              print("yt-dlp version:", ytdlp_version(), "| mode:", MODE, "| upload:", UP, "| spoiler:", SPOILER,
+                    "| mtproto connections:", MT_CONNS, "| attempt:", ATTEMPT)
+              try:
+                  if MODE == "link":
+                      run_link()
+                  else:
+                      run_download()
+              finally:
+                  clear_out()   # no leftovers (temp files, thumbnails) whatever happened
 
 
           if __name__ == "__main__":
@@ -1614,14 +2163,31 @@ jobs:
                   job = os.environ["JOB"].strip()
                   raw = base64.urlsafe_b64decode(job + "=" * (-len(job) % 4))
                   d = json.loads(AESGCM(key).decrypt(raw[:12], raw[12:], None))
-                  m = {"chat": str(d.get("c", "")), "status": str(d.get("s", "") or "")}
+                  m = {"chat": str(d.get("c", "")), "status": str(d.get("s", "") or ""),
+                       "cb": str(d.get("cb", "") or ""), "id": str(d.get("id", "") or ""), "jt": str(d.get("jt", "") or ""),
+                       "nb": bool(d.get("nb"))}
               except Exception:
                   pass
-          if not m or not m.get("status"):
+          if not m:
               raise SystemExit
+          cancelled = False
+          if m.get("cb") and m.get("id") and m.get("jt") and not m.get("nb"):
+              # Free the queue slot and learn whether the user had asked to cancel.
+              try:
+                  body = json.dumps({"op": "done", "id": m["id"], "jt": m["jt"], "ok": False, "retryable": True,
+                                     "cancelled": False, "reason": "crash", "ids": []}).encode()
+                  req = urllib.request.Request(m["cb"].rstrip("/") + "/cb", body, {"Content-Type": "application/json"})
+                  cancelled = bool(json.load(urllib.request.urlopen(req, timeout=20)).get("cancelled"))
+              except Exception:
+                  pass
+          if not m.get("status"):
+              raise SystemExit
+          retry = bool(m.get("cb") and m.get("id")) and not cancelled and not m.get("nb")
+          text = "Cancelled\nThe download was stopped." if cancelled else (
+              "Something went wrong\nReason: The download stopped unexpectedly.\nNext step: Try again.")
+          kb = {"inline_keyboard": [[{"text": "Retry", "callback_data": "r:" + m["id"]}]] if retry else []}
           data = urllib.parse.urlencode({
-              "chat_id": m["chat"], "message_id": m["status"],
-              "text": "Something went wrong. Please try again.",
+              "chat_id": m["chat"], "message_id": m["status"], "text": text, "reply_markup": json.dumps(kb),
           }).encode()
           try:
               urllib.request.urlopen("https://api.telegram.org/bot" + os.environ["BOT_TOKEN"] + "/editMessageText", data, timeout=20)
