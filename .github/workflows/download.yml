@@ -13,6 +13,7 @@ run-name: Download
 #   Cookies can also be managed from Telegram with /admin in the bot (they are merged with YTDLP_COOKIES).
 # - Optional repository variable (Settings -> Secrets and variables -> Actions -> Variables):
 #   MT_CONNS = number of parallel connections for large MTProto uploads (default 6, 1 turns it off).
+#   MT_SPOILER = set to 0 to switch the spoiler on large (MTProto) files off; it is on by default.
 # - The job talks to the bot's Worker (heartbeat, Cancel button, result, cookies). Without that address in the
 #   job (manual runs) all of this is simply skipped.
 
@@ -77,24 +78,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - name: Set up Python
-        id: py
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
       - name: Tools cache key
         id: ck
-        run: echo "bucket=$(( $(date +%s) / 86400 / UPDATE_EVERY_DAYS ))" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "bucket=$(( $(date +%s) / 86400 / UPDATE_EVERY_DAYS ))" >> "$GITHUB_OUTPUT"
+          echo "py=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" >> "$GITHUB_OUTPUT"
 
       - name: Restore tools cache
         id: tools
         uses: actions/cache/restore@v5
         with:
           path: /home/runner/dltools
-          key: tools-v2-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ steps.ck.outputs.bucket }}
+          key: tools-v3-${{ runner.os }}-py${{ steps.ck.outputs.py }}-${{ steps.ck.outputs.bucket }}
           restore-keys: |
-            tools-v2-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-
+            tools-v3-${{ runner.os }}-py${{ steps.ck.outputs.py }}-
 
       # Runs only when there is no fresh cache (about once per UPDATE_EVERY_DAYS days).
       # A stale cache is restored first, so this is an in-place upgrade, not a full reinstall.
@@ -107,7 +104,15 @@ jobs:
           set -euo pipefail
           T="$TOOLS_DIR"
           mkdir -p "$T/bin"
-          [ -x "$T/venv/bin/python" ] || python -m venv "$T/venv"
+          if [ ! -x "$T/venv/bin/python" ]; then
+            python3 -m venv "$T/venv" || {
+              echo "python3-venv is missing, installing it (one time)"
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv
+              rm -rf "$T/venv"
+              python3 -m venv "$T/venv"
+            }
+          fi
           PIPX="$T/venv/bin/python -m pip"
           $PIPX install --disable-pip-version-check --progress-bar off -U \
             'yt-dlp[default,curl-cffi]' requests cryptography 'telethon>=1.36' PySocks
@@ -158,21 +163,6 @@ jobs:
           path: /home/runner/dltools
           key: ${{ steps.tools.outputs.cache-primary-key }}
 
-      - name: Activate tools
-        timeout-minutes: 6
-        run: |
-          set -euo pipefail
-          echo "$TOOLS_DIR/bin" >> "$GITHUB_PATH"
-          echo "$TOOLS_DIR/venv/bin" >> "$GITHUB_PATH"
-          export PATH="$TOOLS_DIR/venv/bin:$TOOLS_DIR/bin:$PATH"
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            echo "ffmpeg missing, installing from apt (rare fallback)"
-            sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
-          fi
-          echo "yt-dlp $(python -m yt_dlp --version)"
-          ffmpeg -version | head -n 1
-
       - name: Download and send
         timeout-minutes: 25
         env:
@@ -191,8 +181,15 @@ jobs:
           YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
           YTDLP_PROXY: ${{ secrets.YTDLP_PROXY }}
           MT_CONNS: ${{ vars.MT_CONNS }}
+          MT_SPOILER: ${{ vars.MT_SPOILER }}
           PYTHONUNBUFFERED: "1"
         run: |
+          export PATH="$TOOLS_DIR/venv/bin:$TOOLS_DIR/bin:$PATH"
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            echo "ffmpeg missing, installing from apt (rare fallback)"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+          fi
           "$TOOLS_DIR/venv/bin/python" - <<'PY'
           import asyncio, base64, glob, hashlib, html as htmllib, importlib, ipaddress, json, math, os, re, signal, socket, subprocess, sys, threading, time, traceback
           from urllib.parse import urljoin, urlparse
@@ -225,6 +222,7 @@ jobs:
 
 
           MT_CONNS = _int_env("MT_CONNS", 6, 1, 10)   # parallel MTProto upload connections (1 = off)
+          MT_SPOILER = (os.environ.get("MT_SPOILER", "") or "").strip().lower() not in ("0", "false", "off", "no")  # spoiler on large files
           CB, JOB_ID, JOB_TOKEN = "", "", ""          # Worker callback address, job id, job token (set by load_job)
           NB = False                                  # True: the Worker has no queue, so no Cancel/Retry buttons and no heartbeats
           RP = ""                                     # id of the user's own message to reply to (only when it was not deleted)
@@ -254,7 +252,7 @@ jobs:
           # ============================================================================
           SITES = [
               "instagram.com", "tiktok.com", "twitter.com", "x.com", "reddit.com", "redd.it", "pin.it",
-              "youtube.com", "youtu.be", "pornhub.com",
+              "youtube.com", "youtu.be", "pimpbunny.com",
           ]
           # pinterest.* with any country domain is matched separately below.
           # ============================================================================
@@ -905,6 +903,14 @@ jobs:
 
 
           def ytdlp_version():
+              """The installed yt-dlp version. Read from the package metadata (milliseconds); starting yt-dlp just to ask
+              for its version costs a couple of seconds, so that is only the fallback."""
+              try:
+                  import importlib.metadata as md
+                  importlib.invalidate_caches()
+                  return md.version("yt-dlp").strip()
+              except Exception:
+                  pass
               try:
                   r = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"], capture_output=True, text=True,
                                      timeout=60, stdin=subprocess.DEVNULL)
@@ -1766,6 +1772,60 @@ jobs:
                           pass
 
 
+          def telethon_can_spoiler():
+              """Telethon's send_file has no spoiler option. The spoiler flag exists on the media objects of newer Telegram
+              layers, so it is available when those classes have the parameter. Checked before anything is uploaded."""
+              try:
+                  import inspect
+                  from telethon.tl.types import InputMediaUploadedDocument, InputMediaUploadedPhoto
+                  return ("spoiler" in inspect.signature(InputMediaUploadedDocument).parameters
+                          and "spoiler" in inspect.signature(InputMediaUploadedPhoto).parameters)
+              except Exception:
+                  return False
+
+
+          def spoiler_kind(path):
+              """'video' / 'photo' when this file can carry a spoiler over MTProto, else ''.
+              (Telegram has no spoiler for documents, so photos over 10 MB and unusual formats never get one.)"""
+              ext = os.path.splitext(path)[1].lower()
+              if ext in VIDEO_EXT:
+                  return "video"
+              if ext in (".jpg", ".jpeg", ".png") and os.path.getsize(path) <= 10 * MB:
+                  return "photo"
+              return ""
+
+
+          async def build_spoiler_media(client, path, kind, handle, cb):
+              """Builds the same media object send_file would build, with the spoiler flag set, so that it can be passed to
+              send_file as ready-made media. `handle` is the finished upload (or None: then the file is uploaded here)."""
+              import mimetypes
+              from telethon.tl.types import (DocumentAttributeFilename, DocumentAttributeVideo, InputMediaUploadedDocument,
+                                             InputMediaUploadedPhoto)
+              if handle is None:
+                  handle = await client.upload_file(path, progress_callback=cb)
+              if kind == "photo":
+                  return InputMediaUploadedPhoto(file=handle, spoiler=True)
+              dur, w, h = probe(path)
+              attrs = [DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True),
+                       DocumentAttributeFilename(file_name=os.path.basename(path))]
+              thumb_handle = None
+              thumb = make_thumb(path)
+              if thumb:
+                  try:
+                      thumb_handle = await client.upload_file(thumb)
+                  except Exception as e:
+                      print("thumbnail upload failed:", type(e).__name__)
+              return InputMediaUploadedDocument(file=handle, mime_type=mimetypes.guess_type(path)[0] or "video/mp4",
+                                                attributes=attrs, thumb=thumb_handle, spoiler=True)
+
+
+          def safe_to_resend(e):
+              """False only for errors where the message may already have been created (the connection broke or timed out
+              while waiting for Telegram's answer): sending again could then duplicate it. Everything else is either an
+              answer from Telegram that refused the request or a local error before anything was sent."""
+              return not isinstance(e, (OSError, EOFError, asyncio.TimeoutError))
+
+
           async def mt_send_one(client, peer, path, label, cap):
               """Send one file over MTProto. Returns the list of created message ids ([] on failure)."""
               from telethon.tl.types import DocumentAttributeVideo
@@ -1778,21 +1838,16 @@ jobs:
                   thumb = make_thumb(path)
                   if thumb:
                       kwargs["thumb"] = thumb
-                  if SPOILER:
-                      kwargs["spoiler"] = True
               elif ext in PHOTO_EXT:
                   if os.path.getsize(path) > 10 * MB:
                       kwargs["force_document"] = True
-                  elif SPOILER:
-                      kwargs["spoiler"] = True
-              elif ext == ".gif":
-                  if SPOILER:
-                      kwargs["spoiler"] = True
-              else:
+              elif ext != ".gif":
                   kwargs["force_document"] = True
               caption = cap.get()
+              media_kwargs = {}
               if caption:
                   kwargs["caption"], kwargs["parse_mode"] = caption, "html"
+                  media_kwargs["caption"], media_kwargs["parse_mode"] = caption, "html"
               reply_to = int(RP) if RP else (int(THREAD) if THREAD else None)
               t0, last = time.time(), [0.0]
 
@@ -1804,21 +1859,40 @@ jobs:
                   sp = cur / max(now - t0, 0.001)
                   loop.run_in_executor(None, status.set, render(label, cur, total, sp, ((total - cur) / sp) if sp else None))
 
-              async def send(src):
-                  try:
-                      return await client.send_file(peer, src, reply_to=reply_to, progress_callback=cb, **kwargs)
-                  except TypeError:
-                      kwargs.pop("spoiler", None)
-                      return await client.send_file(peer, src, reply_to=reply_to, progress_callback=cb, **kwargs)
-
               handle = await parallel_upload(client, path, cb)
-              try:
-                  msg = await send(handle if handle is not None else path)
-              except Exception as e:
-                  if handle is None:
-                      raise
-                  print("sending the parallel upload failed:", type(e).__name__, "- using the normal upload")
-                  msg = await send(path)
+
+              # Spoiler: only when it was asked for, is allowed for this kind of file and this Telethon can do it.
+              media = None
+              kind = spoiler_kind(path)
+              if SPOILER and kind:
+                  if not MT_SPOILER:
+                      print("mtproto spoiler: switched off (MT_SPOILER)")
+                  elif not telethon_can_spoiler():
+                      print("mtproto spoiler: this Telethon version has no spoiler flag, sending without it")
+                  else:
+                      try:
+                          media = await build_spoiler_media(client, path, kind, handle, cb)
+                      except Exception as e:
+                          print("mtproto spoiler: could not prepare it (%s), sending without it" % type(e).__name__)
+
+              attempts = []   # (what, what to send, extra arguments); the first one that works wins
+              if media is not None:
+                  attempts.append(("spoiler media", media, dict(media_kwargs)))
+              if handle is not None:
+                  attempts.append(("parallel upload", handle, dict(kwargs, progress_callback=cb)))
+              attempts.append(("normal upload", path, dict(kwargs, progress_callback=cb)))
+
+              msg = None
+              for i, (what, src, extra) in enumerate(attempts):
+                  try:
+                      msg = await client.send_file(peer, src, reply_to=reply_to, **extra)
+                      if what == "spoiler media":
+                          print("mtproto spoiler: applied")
+                      break
+                  except Exception as e:
+                      if i + 1 >= len(attempts) or not safe_to_resend(e):
+                          raise
+                      print("sending with %s failed (%s), trying the next way" % (what, type(e).__name__))
               if handle is None:
                   took = max(time.time() - t0, 0.001)
                   print("mtproto upload: %.1f MB in %.1fs = %.2f MB/s (single connection)"
@@ -2117,7 +2191,7 @@ jobs:
               start_heartbeat()
               setup_cookies()
               print("yt-dlp version:", ytdlp_version(), "| mode:", MODE, "| upload:", UP, "| spoiler:", SPOILER,
-                    "| mtproto connections:", MT_CONNS, "| attempt:", ATTEMPT)
+                    "| mtproto connections:", MT_CONNS, "| mt spoiler:", MT_SPOILER, "| attempt:", ATTEMPT)
               try:
                   if MODE == "link":
                       run_link()
